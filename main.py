@@ -1,20 +1,27 @@
 import asyncio
 import logging
 import os
+import signal
 import sqlite3
 import sys
+import json
+from asyncio import Task
+from typing import Tuple, Optional, Dict
 
+import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
-from aiogram.types import Message, BotCommand
-from requests import get
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+
+from symbols import get_all
 
 TOKEN = os.getenv('TG_TOKEN')
 assert TOKEN
 dp = Dispatcher()
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN_V2))
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 
 conn = sqlite3.connect('db.sqlite3')
 c = conn.cursor()
@@ -27,21 +34,67 @@ CREATE TABLE IF NOT EXISTS alerts (
 ''')
 conn.commit()
 
+last_price: Optional[float] = None
 
-def get_btc_rate():
-    response = get('https://blockchain.info/ticker').json()
-    btc_to_usd = response['USD']['last']
-    btc_to_rub = response['RUB']['last']
-    return btc_to_usd, btc_to_rub
+
+class Alert(StatesGroup):
+    symbol = State()
+    price = State()
+
+
+async def get_binance_rates() -> Dict[str, float]:
+    async with aiohttp.ClientSession() as session:
+        symbols = json.dumps(list(get_all())).replace(' ', '')
+        params = {'symbols': symbols}
+        async with session.get('https://api.binance.com/api/v3/ticker/price', params=params) as response:
+            prices = {}
+            for price in await response.json():
+                # print(f'PRICE: {prices}')
+                prices[price["symbol"]] = float(price["price"])
+            # btc_to_usd = prices['USD']['last']
+            # btc_to_rub = prices['RUB']['last']
+            return prices
+
+
+async def get_btc_rate() -> Tuple[float, float]:
+    async with aiohttp.ClientSession() as session:
+        async with session.get('https://blockchain.info/ticker') as response:
+            prices = await response.json()
+            btc_to_usd = prices['USD']['last']
+            btc_to_rub = prices['RUB']['last']
+            return float(btc_to_usd), float(btc_to_rub)
 
 
 @dp.message(CommandStart())
 async def send_welcome(message: Message):
-    btc_to_usd, btc_to_rub = get_btc_rate()
-    await message.reply(f"Текущий курс BTC: {btc_to_usd} USD, {btc_to_rub} RUB")
+    prices = await get_binance_rates()
+    prices_str = ''
+    # for symb, price in prices.items():
+    #     prices_str += f'\n*{symb}*: {price}'
+    await bot.send_message(message.chat.id,
+                           f"Текущий курс Bitcoin: {prices['BTCUSDT']} USD\n"
+                           f"А еще ты можешь посмотреть другие курсы и создать уведомления о достижении цены",
+                           reply_markup=InlineKeyboardMarkup(
+                               inline_keyboard=[
+                                   [
+                                       InlineKeyboardButton(text="Посмотреть курсы валют", callback_data="start"),
+                                       InlineKeyboardButton(text="Создать уведомление", callback_data="alert")
+                                   ]
+                               ]
+                           ),
+                           # reply_markup=ReplyKeyboardMarkup(
+                           #     keyboard=[
+                           #         [
+                           #             KeyboardButton(text="Посмотреть курсы валют",),
+                           #             KeyboardButton(text="Создать уведомление"),
+                           #         ]
+                           #     ],
+                           #     resize_keyboard=True,
+                           # ),
+                           )
 
 
-@dp.message(command='help')
+@dp.message(Command('help'))
 async def send_help(message: Message):
     help_text = """
 Команды бота:
@@ -55,15 +108,16 @@ async def send_help(message: Message):
     await message.reply(help_text)
 
 
-@dp.message(commands=['alert'])
+@dp.message(Command('alert'))
 async def set_alert(message: Message):
     try:
+        assert message.text
         alert_price = int(message.text.split()[1])
     except (ValueError, TypeError):
-        await message.reply("Значение курса должно быть целое число")
+        await message.reply('Значение курса должно быть целое число')
         return
     except IndexError:
-        await message.reply(f'Команда должна быть в следующем формате: */alert price*, где price - целое число')
+        await message.reply('Команда должна быть в формате: /alert price, где price - целое число')
         return
 
     user_id = message.chat.id
@@ -72,67 +126,89 @@ async def set_alert(message: Message):
     await message.reply(f"Установлено уведомление на цену {alert_price} USD")
 
 
-@dp.message(commands=['alerts'])
+@dp.message(Command('alerts'))
 async def list_alerts(message: Message):
     user_id = message.chat.id
     c.execute("SELECT price FROM alerts WHERE user_id=?", (user_id,))
     alerts = c.fetchall()
     if alerts:
-        reply = "Активные уведомления:\n"
+        reply = 'Активные уведомления:\n'
         for alert in alerts:
-            reply += f"Цена: {alert[0]} USD\n"
+            reply += f'Цена: {alert[0]} USD\n'
     else:
-        reply = "Нет активных уведомлений."
+        reply = 'Нет активных уведомлений.'
     await message.reply(reply)
 
 
-@dp.message(commands=['clear'])
+@dp.message(Command('clear'))
 async def clear_alerts(message: Message):
+    """Clear all alerts"""
     user_id = message.chat.id
     c.execute("DELETE FROM alerts WHERE user_id=?", (user_id,))
     conn.commit()
-    await message.reply("Все уведомления удалены.")
+    await message.reply('Все уведомления удалены')
 
 
-@dp.message(commands=['del'])
+@dp.message(Command('del'))
 async def delete_alert(message: Message):
+    """Delete the alert"""
     try:
+        assert message.text
         alert_price = int(message.text.split()[1])
     except (ValueError, TypeError):
-        await message.reply("Значение цены должно быть целое число")
+        await message.reply('Значение цены должно быть целое число')
         return
     except IndexError:
-        await message.reply(f'Команда должна быть в следующем формате: "/del price", где price - целое число')
+        await message.reply('Команда должна быть в формате: "/del price", где price - целое число')
         return
 
     user_id = message.chat.id
     c.execute("DELETE FROM alerts WHERE user_id=? AND price=?", (user_id, alert_price))
     conn.commit()
     if c.rowcount:
-        await message.reply(f"Уведомление {alert_price} удалено.")
+        await message.reply(f'Уведомление {alert_price} удалено.')
     else:
-        await message.reply("Уведомление не найдено.")
+        await message.reply('Уведомление не найдено.')
 
 
 async def check_alerts():
+    global last_price
     while True:
-        btc_to_usd, btc_to_rub = get_btc_rate()
-        c.execute("SELECT user_id, price FROM alerts")
-        for user_id, alert_price in c.fetchall():
-            if btc_to_usd >= alert_price:
-                await bot.send_message(user_id, f"Уведомление: цена биткоина достигла {btc_to_rub} RUB, {alert_price} USD")
-                c.execute("DELETE FROM alerts WHERE user_id=? AND price=?", (user_id, alert_price))
-                conn.commit()
-        await asyncio.sleep(60)  # Проверка каждые 60 секунд
+        btc_to_usd, btc_to_rub = await get_btc_rate()
+        if last_price:
+            print(f'Got price {btc_to_usd}')
+            c.execute("SELECT user_id, price FROM alerts")
+            for user_id, alert_price in c.fetchall():
+                if (last_price > alert_price >= btc_to_usd) or (last_price < alert_price <= btc_to_usd):
+                    await bot.send_message(user_id, f'Цена биткоина достигла {btc_to_rub} RUB, {alert_price} USD')
+                    c.execute("DELETE FROM alerts WHERE user_id=? AND price=?", (user_id, alert_price))
+                    conn.commit()
+
+        last_price = btc_to_usd
+        await asyncio.sleep(60)
 
 
-async def run_bot() -> None:
-    # And the run events dispatching
-    await dp.start_polling(bot)
+def stop(*tasks) -> None:
+    def stop_callback(sig: signal.Signals):
+        task: Task
+        for task in tasks:
+            logging.warning(f"Received %s signal for task %s" % (sig.name, task.get_name()))
+            if not task.cancelled():
+                task.cancel()
+        return
+
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, stop_callback, signal.SIGTERM)
+    loop.add_signal_handler(signal.SIGINT, stop_callback, signal.SIGINT)
+
+
+async def main() -> None:
+    bot_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False), name='Bot-task')
+    alert_task = asyncio.create_task(check_alerts(), name='Alert-task')
+    stop(alert_task, bot_task)
+    await asyncio.gather(bot_task, alert_task)
 
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    loop = asyncio.get_event_loop()
-    loop.create_task(run_bot())
-    loop.create_task(check_alerts())
+    asyncio.run(main())
