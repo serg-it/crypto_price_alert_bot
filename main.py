@@ -188,14 +188,13 @@ async def check_alerts():
         await asyncio.sleep(60)
 
 
-def stop(*tasks) -> None:
-    def stop_callback(sig: signal.Signals):
+def tasks_handlers(*tasks) -> None:
+    def stop_callback(sig: signal.Signals) -> None:
         task: Task
         for task in tasks:
-            logging.warning(f"Received %s signal for task %s" % (sig.name, task.get_name()))
+            logging.warning("Received %s signal for task %s", sig.name, task.get_name())
             if not task.cancelled():
-                task.cancel()
-        return
+                task.cancel(f'Cancel task {task.get_name()}')
 
     loop = asyncio.get_running_loop()
     loop.add_signal_handler(signal.SIGTERM, stop_callback, signal.SIGTERM)
@@ -205,8 +204,11 @@ def stop(*tasks) -> None:
 async def main() -> None:
     bot_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False), name='Bot-task')
     alert_task = asyncio.create_task(check_alerts(), name='Alert-task')
-    stop(alert_task, bot_task)
-    await asyncio.gather(bot_task, alert_task)
+    tasks_handlers(alert_task, bot_task)
+    try:
+        await asyncio.gather(bot_task, alert_task)
+    except asyncio.CancelledError as e:
+        logging.info(e)
 
 
 if __name__ == '__main__':
