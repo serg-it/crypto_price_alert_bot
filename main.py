@@ -1,68 +1,21 @@
 import asyncio
 import logging
-import os
-import signal
-import sqlite3
 import sys
-import json
-from asyncio import Task
-from typing import Tuple, Optional, Dict
 
-import aiohttp
-from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
-from symbols import get_all
-
-TOKEN = os.getenv('TG_TOKEN')
-assert TOKEN
-dp = Dispatcher()
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
-
-conn = sqlite3.connect('db.sqlite3')
-c = conn.cursor()
-
-c.execute('''
-CREATE TABLE IF NOT EXISTS alerts (
-    user_id INTEGER,
-    price INTEGER
-)
-''')
-conn.commit()
-
-last_price: Optional[float] = None
+from core.alerts import check_alerts
+from core.db import get_user_alerts, delete_alerts, new_alert
+from core.handlers import tasks_handlers
+from core.prices import get_binance_rates
+from core.tg import dp, bot
 
 
 class Alert(StatesGroup):
     symbol = State()
     price = State()
-
-
-async def get_binance_rates() -> Dict[str, float]:
-    async with aiohttp.ClientSession() as session:
-        symbols = json.dumps(list(get_all())).replace(' ', '')
-        params = {'symbols': symbols}
-        async with session.get('https://api.binance.com/api/v3/ticker/price', params=params) as response:
-            prices = {}
-            for price in await response.json():
-                # print(f'PRICE: {prices}')
-                prices[price["symbol"]] = float(price["price"])
-            # btc_to_usd = prices['USD']['last']
-            # btc_to_rub = prices['RUB']['last']
-            return prices
-
-
-async def get_btc_rate() -> Tuple[float, float]:
-    async with aiohttp.ClientSession() as session:
-        async with session.get('https://blockchain.info/ticker') as response:
-            prices = await response.json()
-            btc_to_usd = prices['USD']['last']
-            btc_to_rub = prices['RUB']['last']
-            return float(btc_to_usd), float(btc_to_rub)
 
 
 @dp.message(CommandStart())
@@ -121,16 +74,14 @@ async def set_alert(message: Message):
         return
 
     user_id = message.chat.id
-    c.execute("INSERT INTO alerts (user_id, price) VALUES (?, ?)", (user_id, alert_price))
-    conn.commit()
+    await new_alert(user_id, alert_price)
     await message.reply(f"Установлено уведомление на цену {alert_price} USD")
 
 
 @dp.message(Command('alerts'))
 async def list_alerts(message: Message):
     user_id = message.chat.id
-    c.execute("SELECT price FROM alerts WHERE user_id=?", (user_id,))
-    alerts = c.fetchall()
+    alerts = await get_user_alerts(user_id)
     if alerts:
         reply = 'Активные уведомления:\n'
         for alert in alerts:
@@ -144,8 +95,7 @@ async def list_alerts(message: Message):
 async def clear_alerts(message: Message):
     """Clear all alerts"""
     user_id = message.chat.id
-    c.execute("DELETE FROM alerts WHERE user_id=?", (user_id,))
-    conn.commit()
+    await delete_alerts(user_id, None)
     await message.reply('Все уведомления удалены')
 
 
@@ -163,42 +113,10 @@ async def delete_alert(message: Message):
         return
 
     user_id = message.chat.id
-    c.execute("DELETE FROM alerts WHERE user_id=? AND price=?", (user_id, alert_price))
-    conn.commit()
-    if c.rowcount:
-        await message.reply(f'Уведомление {alert_price} удалено.')
-    else:
-        await message.reply('Уведомление не найдено.')
-
-
-async def check_alerts():
-    global last_price
-    while True:
-        btc_to_usd, btc_to_rub = await get_btc_rate()
-        if last_price:
-            print(f'Got price {btc_to_usd}')
-            c.execute("SELECT user_id, price FROM alerts")
-            for user_id, alert_price in c.fetchall():
-                if (last_price > alert_price >= btc_to_usd) or (last_price < alert_price <= btc_to_usd):
-                    await bot.send_message(user_id, f'Цена биткоина достигла {btc_to_rub} RUB, {alert_price} USD')
-                    c.execute("DELETE FROM alerts WHERE user_id=? AND price=?", (user_id, alert_price))
-                    conn.commit()
-
-        last_price = btc_to_usd
-        await asyncio.sleep(60)
-
-
-def tasks_handlers(*tasks) -> None:
-    def stop_callback(sig: signal.Signals) -> None:
-        task: Task
-        for task in tasks:
-            logging.warning("Received %s signal for task %s", sig.name, task.get_name())
-            if not task.cancelled():
-                task.cancel(f'Cancel task {task.get_name()}')
-
-    loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGTERM, stop_callback, signal.SIGTERM)
-    loop.add_signal_handler(signal.SIGINT, stop_callback, signal.SIGINT)
+    await delete_alerts(user_id, alert_price)
+    await message.reply(f'Уведомление {alert_price} удалено.')
+    # else:
+    #     await message.reply('Уведомление не найдено.')
 
 
 async def main() -> None:
